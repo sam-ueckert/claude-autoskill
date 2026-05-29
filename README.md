@@ -8,10 +8,10 @@ Based on the [MUSE-AutoSkill](https://arxiv.org/abs/2605.27366) lifecycle: **cre
 
 ## How it works
 
-Claude Code hooks fire `autoskill.py --capture` on every user prompt, assistant stop, session end, and pre-compact event. The script:
+Four Claude Code hooks fire `autoskill.py --capture` on lifecycle events. The script:
 
-1. Archives the turn to `~/.claude/autoskill/data/archive.db` (SQLite)
-2. Checks whether the turn threshold has been reached (`extract_every_turns`, default 8)
+1. Archives each turn (user + assistant) to `~/.claude/autoskill/data/archive.db` (SQLite)
+2. Checks whether enough new turns have accumulated since the last extraction
 3. If so, calls `claude -p` with the archived turns and a list of already-installed skills
 4. Parses the JSON response and writes any new skills to `~/.claude/skills/as-<name>/SKILL.md`
 
@@ -21,23 +21,71 @@ Skills are immediately available as `/as-<name>` slash commands in any Claude Co
 
 ## Installation
 
-### 1. Copy files
+### 1. Clone and copy files
 
 ```bash
-mkdir -p ~/.claude/autoskill
-cp autoskill.py config.json ~/.claude/autoskill/
-chmod +x ~/.claude/autoskill/autoskill.py
+git clone https://github.com/wwt/claude-autoskill.git
+mkdir -p ~/.claude/autoskill ~/.claude/skills/autoskill
+cp claude-autoskill/autoskill.py ~/.claude/autoskill/
+cp claude-autoskill/config.json  ~/.claude/autoskill/
+cp claude-autoskill/SKILL.md     ~/.claude/skills/autoskill/
 ```
 
-### 2. Wire up hooks in `~/.claude/settings.json`
+### 2. Wire up the hooks
+
+Add the following to `~/.claude/settings.json` (merge into any existing `hooks` block):
 
 ```json
 {
   "hooks": {
-    "UserPromptSubmit": [{"matcher": "", "hooks": [{"type": "command", "command": "python3 ~/.claude/autoskill/autoskill.py --capture", "async": true}]}],
-    "Stop":             [{"matcher": "", "hooks": [{"type": "command", "command": "python3 ~/.claude/autoskill/autoskill.py --capture", "async": true}]}],
-    "SessionEnd":       [{"matcher": "", "hooks": [{"type": "command", "command": "python3 ~/.claude/autoskill/autoskill.py --capture", "async": true}]}],
-    "PreCompact":       [{"matcher": "", "hooks": [{"type": "command", "command": "python3 ~/.claude/autoskill/autoskill.py --capture", "async": true}]}]
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/autoskill/autoskill.py --capture",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/autoskill/autoskill.py --capture",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/autoskill/autoskill.py --capture",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/autoskill/autoskill.py --capture",
+            "async": true
+          }
+        ]
+      }
+    ]
   }
 }
 ```
@@ -50,44 +98,81 @@ All hooks run `async: true` so they never block Claude Code.
 python3 ~/.claude/autoskill/autoskill.py --status
 ```
 
+Expected output includes `Sessions archived`, `Skills installed`, and recent autoskills. If the DB is empty, the hooks haven't fired yet — start a new Claude Code session and run one prompt to seed the archive.
+
 ---
 
+## The `/autoskill` skill
+
+`SKILL.md` ships alongside `autoskill.py`. Installing it to `~/.claude/skills/autoskill/SKILL.md` registers `/autoskill` as a slash command in Claude Code. From any session you can then type:
+
+```
+/autoskill status
+/autoskill import
+/autoskill extract-all
+/autoskill refine
+```
+
+The skill follows the standard Claude Code SKILL.md schema:
+
+```
+---
+name: autoskill
+description: <one-liner that triggers the skill>
+---
+# Title
+## When to use
+## Commands / Steps
 ## Configuration
+```
 
-Edit `~/.claude/autoskill/config.json`:
+---
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `enabled` | `true` | Master on/off switch |
-| `extract_every_turns` | `8` | Run extraction after this many new archived turns |
-| `min_turns_extraction` | `4` | Don't extract if session has fewer turns than this |
-| `max_skills_per_run` | `3` | Cap on skills generated per extraction pass |
-| `model` | `claude-sonnet-4-6` | Model used for extraction |
-| `skill_prefix` | `as-` | Directory prefix for autoskill-generated skills |
-| `max_content_chars` | `2000` | Truncation limit per turn before sending to LLM |
-| `max_turns_context` | `40` | Maximum turns sent to the extraction LLM |
-| `log_level` | `info` | `debug` \| `info` \| `error` |
+## Hook behavior
+
+Each hook event archives a different part of the conversation:
+
+| Hook event | What fires it | What autoskill does |
+|---|---|---|
+| `UserPromptSubmit` | User sends a message | Archives the user turn to SQLite |
+| `Stop` | Claude finishes responding | Archives the assistant turn; runs extraction if turn threshold reached |
+| `SessionEnd` | Session closes | Final extraction pass for any unextracted turns |
+| `PreCompact` | Context window auto-compacts | Extraction pass before context is summarized (prevents losing patterns) |
+
+The `PreCompact` hook is particularly important: without it, a long session's early content — where the most reusable patterns often live — can be lost before extraction runs.
 
 ---
 
 ## Prospective skill creation
 
-**Prospective** means skills extracted from sessions as they happen — the default mode.
+**Prospective** means skills extracted from sessions as they happen — the default, zero-config mode once hooks are wired.
 
-The hook fires on every turn. When the delta since the last extraction crosses `extract_every_turns`, the extractor runs inline (the hook is async, so this doesn't block you). Extraction also runs at `SessionEnd` and `PreCompact` to ensure nothing is lost at context boundaries.
+Every time Claude stops responding (`Stop` event), the hook archives the turn and checks the delta since the last extraction. When the delta crosses `extract_every_turns` (default 8), extraction runs inline. Because the hook is already `async: true`, this never blocks you.
 
-The LLM evaluates the conversation against a strict quality bar:
+Extraction sends the archived turns plus a list of already-installed skills to `claude -p`. The LLM evaluates against a quality bar and returns a JSON array of skills. New skills land in `~/.claude/skills/as-<name>/SKILL.md` and are live immediately.
 
-- **Extract:** non-obvious multi-step workflows, recurring procedures, specific tool/flag combinations, domain debugging methods
-- **Skip:** single commands, one-off patches, common knowledge, near-duplicates of existing skills
+### Quality bar
 
-New skills land in `~/.claude/skills/as-<name>/SKILL.md` and are live immediately.
+The extractor explicitly includes:
+
+- Non-obvious multi-step workflows (not "run git status")
+- Recurring procedures for a class of problems
+- Specific tool combinations, flag sets, or config tricks
+- Domain-specific debugging or investigation methods
+- Learned knowledge that saves time on repeat encounters
+
+And explicitly excludes:
+
+- Single-command answers
+- One-off project-specific patches
+- Common knowledge any developer already knows
+- Near-duplicates of existing skills
 
 ---
 
 ## Retrospective skill creation
 
-**Retrospective** means mining skills from sessions that happened before AutoSkill was installed.
+**Retrospective** means mining skills from sessions that existed before AutoSkill was installed, or sessions where hooks weren't running.
 
 ### Step 1 — import historical transcripts
 
@@ -95,7 +180,7 @@ New skills land in `~/.claude/skills/as-<name>/SKILL.md` and are live immediatel
 python3 ~/.claude/autoskill/autoskill.py --import
 ```
 
-Reads every `.jsonl` file under `~/.claude/projects/`, parses user and assistant turns, and loads them into the archive. Sessions already in the archive are skipped.
+Reads every `.jsonl` file under `~/.claude/projects/`, parses user and assistant turns, and loads them into the archive. Sessions already in the archive are skipped. Prints a summary of imported sessions and turn counts.
 
 ### Step 2 — extract from all unprocessed sessions
 
@@ -103,36 +188,33 @@ Reads every `.jsonl` file under `~/.claude/projects/`, parses user and assistant
 python3 ~/.claude/autoskill/autoskill.py --extract-all
 ```
 
-Iterates every archived session that has unprocessed turns (more turns than the last extraction recorded) and runs extraction on each. Processes highest-turn-count sessions first.
+Iterates every archived session that has more turns than its last recorded extraction (i.e. unprocessed turns exist), and runs extraction on each. Processes highest-turn-count sessions first for the best yield early.
 
-### Extract a single session
-
-If you want to target one specific session:
+### Target a single session
 
 ```bash
 python3 ~/.claude/autoskill/autoskill.py --extract <session-id>
 ```
 
-The session ID is the stem of the `.jsonl` filename (the UUID portion).
+The session ID is the UUID stem of the `.jsonl` filename in `~/.claude/projects/*/`.
 
 ---
 
 ## Refinement
 
-The refinement pass (MUSE lifecycle step 5) reviews all installed autoskills as a batch and suggests improvements:
+The refinement pass (MUSE lifecycle step 5) reviews all installed autoskills as a batch:
 
 ```bash
 python3 ~/.claude/autoskill/autoskill.py --refine
 ```
 
 For each skill the LLM assesses:
+
 - Is the description precise enough to match the right user request?
 - Are the instructions clear and actionable?
 - Should any two skills be merged?
 
-Actions applied: `keep`, `update` (rewrites description + content), `merge` (consolidates into one), `delete` (removes the skill directory).
-
-Run refinement periodically after accumulating a batch of new skills, or after changing domains of work.
+Actions applied: `keep`, `update` (rewrites description + content), `merge` (consolidates two into one), `delete` (removes the skill directory). Run refinement periodically after accumulating a batch of new skills or after changing domains of work.
 
 ---
 
@@ -142,7 +224,28 @@ Run refinement periodically after accumulating a batch of new skills, or after c
 python3 ~/.claude/autoskill/autoskill.py --status
 ```
 
-Shows archive stats (sessions, turns, extractions, skills generated), current config, and the 10 most recently written autoskills.
+Shows:
+- Current config (model, thresholds, prefix)
+- Archive path and counts (sessions, turns, extractions, skills generated)
+- 10 most recently written autoskills with descriptions
+
+---
+
+## Configuration
+
+Edit `~/.claude/autoskill/config.json`:
+
+| Key | Default | Description |
+|---|---|---|
+| `enabled` | `true` | Master on/off switch |
+| `extract_every_turns` | `8` | Run extraction after this many new archived turns |
+| `min_turns_extraction` | `4` | Skip extraction if session has fewer turns than this |
+| `max_skills_per_run` | `3` | Cap on skills generated per extraction pass |
+| `model` | `claude-sonnet-4-6` | Model used for extraction and refinement |
+| `skill_prefix` | `as-` | Directory prefix for autoskill-generated skills |
+| `max_content_chars` | `2000` | Truncation limit per turn before sending to LLM |
+| `max_turns_context` | `40` | Maximum turns sent to the extraction LLM |
+| `log_level` | `info` | `debug` \| `info` \| `error` |
 
 ---
 
@@ -150,42 +253,34 @@ Shows archive stats (sessions, turns, extractions, skills generated), current co
 
 ```
 ~/.claude/autoskill/
-├── autoskill.py       # main script
-├── config.json        # configuration
-├── autoskill.log      # operation log
+├── autoskill.py       # main script (this repo)
+├── config.json        # configuration (this repo)
+├── autoskill.log      # operation log (gitignored)
 └── data/
-    └── archive.db     # SQLite: turns + extraction history
+    └── archive.db     # SQLite: turns + extraction history (gitignored)
 
 ~/.claude/skills/
+├── autoskill/
+│   └── SKILL.md       # /autoskill slash command (this repo)
 └── as-<name>/
-    └── SKILL.md       # generated skill (slash command)
+    └── SKILL.md       # auto-generated skills
 ```
-
-The `data/` directory and log are gitignored in this repo — they are local to each machine.
-
----
-
-## What makes a good skill
-
-The extractor uses this bar internally; it helps to understand it when reviewing output:
-
-- Captures a **non-obvious multi-step workflow** (not "run git status")
-- Encodes a **recurring procedure** for a class of problems
-- Documents a **specific tool combination**, flag set, or config trick
-- Describes a **domain-specific debugging or investigation method**
-- Represents **learned knowledge** that saves time on repeat encounters
-
-Single-command answers, one-off patches, and common knowledge are explicitly excluded.
 
 ---
 
 ## Troubleshooting
 
 **No skills appearing after many sessions**
-Check `~/.claude/autoskill/autoskill.log`. Set `log_level: "debug"` in `config.json` for verbose output. Confirm `claude -p` works from your shell — the extractor relies on Claude Code's auth environment.
+Check `~/.claude/autoskill/autoskill.log`. Set `log_level: "debug"` in `config.json` for verbose output. Confirm `claude -p` works from your shell — the extractor relies on Claude Code's auth environment being inherited by the hook subprocess.
+
+**`claude -p` not found in hook subprocess**
+The hook runs with a minimal environment. Add the Claude Code binary to a PATH that hook subprocesses inherit, or use the full path: `command: "/full/path/to/claude -p ..."`.
 
 **Duplicate or low-quality skills**
 Run `--refine`. Also consider lowering `max_skills_per_run` or raising `min_turns_extraction` to be more selective.
 
 **Extraction running too frequently / not frequently enough**
-Adjust `extract_every_turns` in `config.json`. Lower = more frequent (higher API cost). Higher = coarser but cheaper.
+Adjust `extract_every_turns`. Lower = more frequent (higher API cost). Higher = coarser but cheaper.
+
+**JSON parse errors in log**
+The LLM occasionally adds commentary before the JSON array. The script strips markdown fences but may miss other preamble. These sessions are logged as 0 skills and skipped — they don't corrupt the archive.
