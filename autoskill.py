@@ -10,8 +10,9 @@ Based on MUSE-AutoSkill (arxiv 2605.27366):
 Usage:
   autoskill.py --capture          # Called by hooks (reads JSON from stdin)
   autoskill.py --extract <sid>    # Extract skills for one session
-  autoskill.py --import           # Batch import historical transcripts
+  autoskill.py --import           # Batch import all historical transcripts
   autoskill.py --extract-all      # Extract from all unprocessed sessions
+  autoskill.py --search [query]   # Interactive search + select sessions to add
   autoskill.py --status           # Show counts and recent skills
   autoskill.py --refine           # Re-evaluate and improve existing skills
 """
@@ -445,6 +446,141 @@ def handle_pre_compact(payload: dict, config: dict, conn: sqlite3.Connection):
         log(f"PreCompact: {current - last} unextracted turns, running extraction")
         run_extraction(session_id, config, conn)
 
+# ── Transcript Helpers ────────────────────────────────────────────────────
+
+def _import_transcript_file(tp: Path, session_id: str, cwd: str, conn) -> int:
+    """Parse one .jsonl transcript and archive its turns. Returns turns added."""
+    turns_added = 0
+    for raw_line in tp.read_text(errors="replace").splitlines():
+        try:
+            entry = json.loads(raw_line)
+        except Exception:
+            continue
+
+        etype = entry.get("type")
+        msg   = entry.get("message", {})
+
+        if etype == "user":
+            content = msg.get("content", [])
+            text = ""
+            if isinstance(content, list):
+                text = " ".join(
+                    b.get("text", "") for b in content if b.get("type") == "text"
+                )
+            elif isinstance(content, str):
+                text = content
+            if text.strip():
+                save_turn(conn, session_id, "user", text.strip(), cwd)
+                turns_added += 1
+
+        elif etype == "assistant":
+            content = msg.get("content", [])
+            parts = []
+            if isinstance(content, list):
+                for b in content:
+                    if b.get("type") == "text" and b.get("text", "").strip():
+                        parts.append(b["text"])
+                    elif b.get("type") == "tool_use":
+                        parts.append(f"[Tool: {b.get('name','')}]")
+            elif isinstance(content, str) and content.strip():
+                parts = [content]
+            if parts:
+                save_turn(conn, session_id, "assistant", "\n".join(parts).strip(), cwd)
+                turns_added += 1
+
+    return turns_added
+
+
+def scan_transcripts(query: str = "", conn=None) -> list[dict]:
+    """
+    Return metadata for all project transcripts, optionally filtered by query.
+    Query matches case-insensitively against title and project directory.
+    """
+    projects = Path.home() / ".claude" / "projects"
+    results  = []
+
+    for tp in sorted(projects.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True):
+        session_id = tp.stem
+        project    = tp.parent.name
+        cwd        = project.lstrip("-").replace("-", "/")
+        title      = ""
+
+        try:
+            for raw_line in tp.read_text(errors="replace").splitlines():
+                try:
+                    entry = json.loads(raw_line)
+                except Exception:
+                    continue
+                etype = entry.get("type")
+                if etype == "ai-title":
+                    t = entry.get("aiTitle", "")
+                    if t:
+                        title = t          # keep last — titles refine over the session
+                elif etype == "user" and not cwd:
+                    cwd = entry.get("cwd", cwd)
+        except Exception:
+            continue
+
+        if not title:
+            title = f"({session_id[:8]})"
+
+        query_lower = query.lower()
+        if query_lower and query_lower not in title.lower() and query_lower not in cwd.lower():
+            continue
+
+        # DB status
+        status         = "new"
+        archived_turns = 0
+        skills_created = 0
+        if conn:
+            archived_turns = get_turn_count(conn, session_id)
+            if archived_turns > 0:
+                row = conn.execute(
+                    "SELECT COALESCE(SUM(skills_created),0) FROM extractions WHERE session_id=?",
+                    (session_id,)
+                ).fetchone()
+                skills_created = row[0] if row else 0
+                status = "extracted" if skills_created > 0 else "imported"
+
+        # Approximate turn count for unimported sessions from line count
+        display_turns = archived_turns or sum(1 for _ in tp.open("rb"))
+
+        results.append({
+            "session_id":     session_id,
+            "title":          title,
+            "project":        project,
+            "cwd":            cwd,
+            "date":           datetime.fromtimestamp(tp.stat().st_mtime).strftime("%Y-%m-%d"),
+            "turns":          display_turns,
+            "status":         status,
+            "skills_created": skills_created,
+            "path":           tp,
+        })
+
+    return results
+
+
+def parse_selection(raw: str, max_n: int) -> list[int]:
+    """Parse '1 3 5', '2-4', 'all', or mixed into a sorted list of 1-based indices."""
+    raw = raw.strip().lower()
+    if raw == "all":
+        return list(range(1, max_n + 1))
+    indices: set[int] = set()
+    for token in re.split(r"[\s,]+", raw):
+        token = token.strip()
+        if not token:
+            continue
+        m = re.match(r"^(\d+)-(\d+)$", token)
+        if m:
+            lo, hi = int(m.group(1)), int(m.group(2))
+            indices.update(n for n in range(lo, hi + 1) if 1 <= n <= max_n)
+        elif token.isdigit():
+            n = int(token)
+            if 1 <= n <= max_n:
+                indices.add(n)
+    return sorted(indices)
+
+
 # ── CLI Commands ───────────────────────────────────────────────────────────
 
 def cmd_capture():
@@ -495,48 +631,9 @@ def cmd_import():
         if get_turn_count(conn, session_id) > 0:
             continue  # already imported
 
-        # Infer cwd from the path component
         cwd = tp.parent.name.lstrip("-").replace("-", "/")
-        turns_added = 0
-
         try:
-            for raw_line in tp.read_text(errors="replace").splitlines():
-                try:
-                    entry = json.loads(raw_line)
-                except Exception:
-                    continue
-
-                etype = entry.get("type")
-                msg   = entry.get("message", {})
-
-                if etype == "user":
-                    content = msg.get("content", [])
-                    text = ""
-                    if isinstance(content, list):
-                        text = " ".join(
-                            b.get("text", "") for b in content if b.get("type") == "text"
-                        )
-                    elif isinstance(content, str):
-                        text = content
-                    if text.strip():
-                        save_turn(conn, session_id, "user", text.strip(), cwd)
-                        turns_added += 1
-
-                elif etype == "assistant":
-                    content = msg.get("content", [])
-                    parts = []
-                    if isinstance(content, list):
-                        for b in content:
-                            if b.get("type") == "text" and b.get("text", "").strip():
-                                parts.append(b["text"])
-                            elif b.get("type") == "tool_use":
-                                parts.append(f"[Tool: {b.get('name','')}]")
-                    elif isinstance(content, str) and content.strip():
-                        parts = [content]
-                    if parts:
-                        save_turn(conn, session_id, "assistant", "\n".join(parts).strip(), cwd)
-                        turns_added += 1
-
+            turns_added = _import_transcript_file(tp, session_id, cwd, conn)
             if turns_added:
                 print(f"  {session_id[:8]}… {turns_added} turns  ({cwd})")
                 imported += 1
@@ -546,6 +643,104 @@ def cmd_import():
     conn.close()
     print(f"\nImported {imported} new session(s).")
     print("Run  autoskill.py --extract-all  to generate skills from historical data.")
+
+
+def cmd_search(query: str):
+    """Interactive search: list matching sessions, select which to import+extract."""
+    conn     = init_db()
+    sessions = scan_transcripts(query, conn)
+    conn.close()
+
+    if not sessions:
+        q_msg = f' matching "{query}"' if query else ""
+        print(f"No sessions found{q_msg}.")
+        return
+
+    q_msg = f' matching "{query}"' if query else ""
+    print(f"\nFound {len(sessions)} session(s){q_msg}:\n")
+
+    # Column widths
+    W_TITLE   = 48
+    W_PROJECT = 22
+    hdr = f"  {'#':>3}  {'Title':<{W_TITLE}}  {'Project':<{W_PROJECT}}  {'Date':>10}  {'Turns':>5}  Status"
+    sep = f"  {'─'*3}  {'─'*W_TITLE}  {'─'*W_PROJECT}  {'─'*10}  {'─'*5}  {'─'*16}"
+    print(hdr)
+    print(sep)
+
+    for i, s in enumerate(sessions, 1):
+        title   = s["title"][:W_TITLE]
+        project = s["project"][:W_PROJECT]
+        if s["status"] == "extracted":
+            status_str = f"extracted ({s['skills_created']} skills)"
+        elif s["status"] == "imported":
+            status_str = "imported"
+        else:
+            status_str = "new"
+        print(f"  {i:>3}  {title:<{W_TITLE}}  {project:<{W_PROJECT}}  {s['date']:>10}  {s['turns']:>5}  {status_str}")
+
+    print()
+    print("Select sessions to import+extract")
+    print("  Numbers / ranges / 'all' / Enter to cancel  →  e.g.  1 3 5   2-4   all")
+    try:
+        raw = input("> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+
+    if not raw:
+        print("Cancelled.")
+        return
+
+    indices = parse_selection(raw, len(sessions))
+    if not indices:
+        print("No valid selection — use numbers, ranges (2-4), or 'all'.")
+        return
+
+    chosen = [sessions[i - 1] for i in indices]
+    print(f"\n{len(chosen)} session(s) selected:")
+    for s in chosen:
+        note = f"  [{s['status']}]" if s["status"] != "new" else ""
+        print(f"  • {s['title'][:65]}{note}")
+
+    print()
+    try:
+        confirm = input("Import and extract? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+
+    if confirm != "y":
+        print("Cancelled.")
+        return
+
+    config           = load_config()
+    conn             = init_db()
+    imported_count   = 0
+    extracted_total  = 0
+
+    for s in chosen:
+        session_id = s["session_id"]
+        print(f"\n  [{session_id[:8]}] {s['title'][:60]}")
+
+        if s["status"] == "new":
+            try:
+                turns_added = _import_transcript_file(s["path"], session_id, s["cwd"], conn)
+                if turns_added:
+                    print(f"    imported {turns_added} turns")
+                    imported_count += 1
+                else:
+                    print("    no turns found, skipping extraction")
+                    continue
+            except Exception as e:
+                print(f"    import error: {e}")
+                continue
+
+        count = run_extraction(session_id, config, conn)
+        extracted_total += count
+        print(f"    extracted {count} skill(s)")
+
+    conn.close()
+    print(f"\nDone — {imported_count} session(s) imported, {extracted_total} skill(s) extracted.")
 
 
 def cmd_extract_all():
@@ -737,6 +932,9 @@ def main():
         cmd_import()
     elif args[0] == "--extract-all":
         cmd_extract_all()
+    elif args[0] == "--search":
+        query = args[1] if len(args) > 1 else ""
+        cmd_search(query)
     elif args[0] == "--refine":
         cmd_refine()
     elif args[0] == "--status":
