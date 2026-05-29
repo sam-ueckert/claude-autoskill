@@ -500,10 +500,10 @@ def scan_transcripts(query: str = "", conn=None) -> list[dict]:
     results  = []
 
     for tp in sorted(projects.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True):
-        session_id = tp.stem
-        project    = tp.parent.name
-        cwd        = project.lstrip("-").replace("-", "/")
-        title      = ""
+        session_id  = tp.stem
+        title       = ""
+        cwd         = ""
+        file_turns  = 0   # actual user+assistant entries counted while reading
 
         try:
             for raw_line in tp.read_text(errors="replace").splitlines():
@@ -516,16 +516,25 @@ def scan_transcripts(query: str = "", conn=None) -> list[dict]:
                     t = entry.get("aiTitle", "")
                     if t:
                         title = t          # keep last — titles refine over the session
-                elif etype == "user" and not cwd:
-                    cwd = entry.get("cwd", cwd)
+                elif etype in ("user", "assistant"):
+                    file_turns += 1
+                    if etype == "user" and not cwd:
+                        cwd = entry.get("cwd", "")
         except Exception:
             continue
 
         if not title:
             title = f"({session_id[:8]})"
 
+        # Derive a short display name from the actual cwd (last 2 path components)
+        if cwd:
+            parts   = [p for p in cwd.strip("/").split("/") if p]
+            project = "/".join(parts[-2:]) if len(parts) >= 2 else (parts[-1] if parts else tp.parent.name)
+        else:
+            project = tp.parent.name
+
         query_lower = query.lower()
-        if query_lower and query_lower not in title.lower() and query_lower not in cwd.lower():
+        if query_lower and query_lower not in title.lower() and query_lower not in project.lower():
             continue
 
         # DB status
@@ -542,8 +551,7 @@ def scan_transcripts(query: str = "", conn=None) -> list[dict]:
                 skills_created = row[0] if row else 0
                 status = "extracted" if skills_created > 0 else "imported"
 
-        # Approximate turn count for unimported sessions from line count
-        display_turns = archived_turns or sum(1 for _ in tp.open("rb"))
+        display_turns = archived_turns if archived_turns else file_turns
 
         results.append({
             "session_id":     session_id,
