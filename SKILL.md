@@ -1,6 +1,6 @@
 ---
 name: autoskill
-description: Manage the AutoSkill system — check status, trigger extraction, import history, refine skills, enable/disable
+description: Manage the AutoSkill system — check status, trigger extraction, search and import history, refine skills, enable/disable
 ---
 
 # AutoSkill
@@ -11,8 +11,10 @@ periodically calls the Claude API to extract reusable `SKILL.md` files into `~/.
 ## When to use
 Invoke `/autoskill` when the user wants to:
 - See what skills have been auto-generated
+- Search past sessions and selectively import them
 - Manually trigger skill extraction
-- Import historical sessions
+- Import all historical sessions at once
+- Refine or clean up existing autoskills
 - Tune extraction frequency or disable AutoSkill
 
 ## Commands
@@ -23,10 +25,14 @@ Run these from a Bash tool call. All output to stdout.
 # Show installed autoskills + archive stats
 python3 ~/.claude/autoskill/autoskill.py --status
 
+# Search sessions interactively — filter by keyword, select which to import+extract
+python3 ~/.claude/autoskill/autoskill.py --search docker
+python3 ~/.claude/autoskill/autoskill.py --search          # no query = show all
+
 # Force extraction for the current session
 python3 ~/.claude/autoskill/autoskill.py --extract "$CLAUDE_SESSION_ID"
 
-# Import all historical transcripts into the archive
+# Import ALL historical transcripts into the archive
 python3 ~/.claude/autoskill/autoskill.py --import
 
 # Extract skills from all imported (unprocessed) sessions
@@ -38,6 +44,18 @@ python3 ~/.claude/autoskill/autoskill.py --refine
 # Tail the live log
 tail -f ~/.claude/autoskill/autoskill.log
 ```
+
+## Search selection syntax
+
+`--search` shows a numbered table then prompts for a selection:
+
+| Input | Meaning |
+|---|---|
+| `1 3 5` | Sessions 1, 3, and 5 |
+| `2-4` | Sessions 2 through 4 |
+| `1 3-5 8` | Mixed numbers and ranges |
+| `all` | Every result |
+| Enter | Cancel |
 
 ## Configuration
 

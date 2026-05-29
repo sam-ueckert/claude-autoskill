@@ -174,7 +174,47 @@ And explicitly excludes:
 
 **Retrospective** means mining skills from sessions that existed before AutoSkill was installed, or sessions where hooks weren't running.
 
-### Step 1 — import historical transcripts
+### Option A — interactive search (recommended)
+
+```bash
+python3 ~/.claude/autoskill/autoskill.py --search <query>
+python3 ~/.claude/autoskill/autoskill.py --search          # no query = show all
+```
+
+Scans all transcripts and shows a numbered table filtered by the query (case-insensitive substring match against title and project directory):
+
+```
+Found 5 session(s) matching "docker":
+
+  #   Title                                             Project                 Date        Turns  Status
+  ─── ────────────────────────────────────────────────  ──────────────────────  ──────────  ─────  ────────────────
+    1  Rancher Desktop containerd debug                 foreman                 2026-05-20     38  new
+    2  Docker image transfer between machines           hackathon-tm7           2026-05-13     42  extracted (1 skills)
+    3  Dockerfile SSH BuildKit setup                    openclaw-ops            2026-05-18     15  new
+
+Select sessions to import+extract
+  Numbers / ranges / 'all' / Enter to cancel  →  e.g.  1 3 5   2-4   all
+> 1 3
+```
+
+**Selection syntax:**
+
+| Input | Meaning |
+|---|---|
+| `1 3 5` | Sessions 1, 3, and 5 |
+| `2-4` | Sessions 2 through 4 |
+| `1 3-5 8` | Mixed |
+| `all` | Every result |
+| Enter | Cancel |
+
+After selection, a confirmation prompt runs before any import or extraction happens. Sessions already in the archive skip the import step and go straight to extraction.
+
+The **Status** column shows:
+- `new` — not yet in the archive
+- `imported` — in archive, no skills extracted yet
+- `extracted (N skills)` — already processed
+
+### Option B — bulk import everything
 
 ```bash
 python3 ~/.claude/autoskill/autoskill.py --import
@@ -182,13 +222,13 @@ python3 ~/.claude/autoskill/autoskill.py --import
 
 Reads every `.jsonl` file under `~/.claude/projects/`, parses user and assistant turns, and loads them into the archive. Sessions already in the archive are skipped. Prints a summary of imported sessions and turn counts.
 
-### Step 2 — extract from all unprocessed sessions
+### Option C — extract all unprocessed sessions
 
 ```bash
 python3 ~/.claude/autoskill/autoskill.py --extract-all
 ```
 
-Iterates every archived session that has more turns than its last recorded extraction (i.e. unprocessed turns exist), and runs extraction on each. Processes highest-turn-count sessions first for the best yield early.
+Iterates every archived session that has more turns than its last recorded extraction and runs extraction on each. Processes highest-turn-count sessions first. Typically run after `--import`.
 
 ### Target a single session
 
@@ -218,16 +258,22 @@ Actions applied: `keep`, `update` (rewrites description + content), `merge` (con
 
 ---
 
-## Status
+## Quick reference
+
+| Command | What it does |
+|---|---|
+| `--status` | Archive stats + 10 most recent skills |
+| `--search [query]` | Interactive table — pick sessions to import+extract |
+| `--import` | Bulk-import all transcripts into the archive |
+| `--extract-all` | Extract skills from every unprocessed archived session |
+| `--extract <id>` | Extract from one specific session |
+| `--refine` | Review and improve all autoskills as a batch |
 
 ```bash
 python3 ~/.claude/autoskill/autoskill.py --status
 ```
 
-Shows:
-- Current config (model, thresholds, prefix)
-- Archive path and counts (sessions, turns, extractions, skills generated)
-- 10 most recently written autoskills with descriptions
+Shows current config (model, thresholds, prefix), archive counts (sessions, turns, extractions, skills generated), and the 10 most recently written autoskills with descriptions.
 
 ---
 
