@@ -1,0 +1,11 @@
+{
+  "enabled":              true,
+  "extract_every_turns":  8,
+  "min_turns_extraction": 4,
+  "max_skills_per_run":   3,
+  "model":                "claude-sonnet-4-6",
+  "skill_prefix":         "as-",
+  "max_content_chars":    2000,
+  "max_turns_context":    40,
+  "log_level":            "info"
+}
