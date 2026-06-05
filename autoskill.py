@@ -287,6 +287,9 @@ def write_skill(skill: dict, prefix: str = "as-") -> bool:
         return False
 
     name      = sanitize_name(raw_name)
+    # Strip prefix if LLM already included it in the generated name
+    if prefix and name.startswith(prefix.rstrip("-")):
+        name = name[len(prefix):]
     dir_name  = f"{prefix}{name}"
     skill_dir = SKILLS_DIR / dir_name
     skill_dir.mkdir(parents=True, exist_ok=True)
