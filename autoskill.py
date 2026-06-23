@@ -15,10 +15,12 @@ Usage:
   autoskill.py --search [query]   # Interactive search + select sessions to add
   autoskill.py --status           # Show counts and recent skills
   autoskill.py --refine           # Re-evaluate and improve existing skills
+  autoskill.py --sync-repo        # Bulk sync all as-* skills to repo_sync_dir
 """
 
 import json
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -314,7 +316,72 @@ description: {description}
 """
     (skill_dir / "SKILL.md").write_text(skill_md)
     log(f"Wrote skill: {dir_name}")
+    _sync_skill_to_repo(dir_name)
     return True
+
+
+def _git(repo_dir, *args, timeout=60):
+    return subprocess.run(
+        ["git", "-C", str(repo_dir), *args],
+        capture_output=True, text=True, timeout=timeout,
+    )
+
+
+def _git_sync_push(repo_dir) -> bool:
+    """Pull-before-push so concurrent pushes from other machines (this repo is
+    shared across hosts) self-heal instead of silently diverging. Pulls with
+    --rebase --autostash, then pushes any local commits (including backlog).
+    On a genuine conflict it aborts the rebase rather than leaving a half-done
+    state, and defers the push for manual resolution. Returns True iff pushed."""
+    try:
+        pull = _git(repo_dir, "pull", "--rebase", "--autostash", timeout=90)
+        if pull.returncode != 0:
+            _git(repo_dir, "rebase", "--abort", timeout=30)
+            log(f"sync: pull --rebase failed, push deferred (resolve manually): "
+                f"{pull.stderr.strip()[:200]}", "error")
+            return False
+        push = _git(repo_dir, "push", timeout=90)
+        if push.returncode != 0:
+            log(f"sync: push failed: {push.stderr.strip()[:200]}", "error")
+            return False
+        return True
+    except Exception as e:
+        log(f"sync: git pull/push error: {e}", "error")
+        return False
+
+
+def _sync_skill_to_repo(dir_name: str):
+    """Copy one skill to repo_sync_dir and git commit, then pull-before-push.
+    Silent if not configured."""
+    config = load_config()
+    repo_dir_str = config.get("repo_sync_dir", "")
+    if not repo_dir_str:
+        return
+    repo_dir = Path(repo_dir_str).expanduser()
+    if not (repo_dir / ".git").exists():
+        log(f"sync: repo not found at {repo_dir}", "debug")
+        return
+    src = SKILLS_DIR / dir_name
+    if not src.exists() or not (src / "SKILL.md").exists():
+        return
+    try:
+        dst = repo_dir / "skills" / dir_name
+        dst.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src / "SKILL.md", dst / "SKILL.md")
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "add", f"skills/{dir_name}/SKILL.md"],
+            capture_output=True, timeout=30,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "commit", "-m", f"autoskill: update {dir_name}"],
+            capture_output=True, text=True, timeout=30,
+        )
+        # Always reconcile + push (even if this commit was a no-op) so any
+        # backlog from earlier failed pushes drains automatically.
+        _git_sync_push(repo_dir)
+        log(f"sync: synced {dir_name} to {repo_dir.name}")
+    except Exception as e:
+        log(f"sync: error for {dir_name}: {e}", "error")
 
 # ── Core Extraction ────────────────────────────────────────────────────────
 
@@ -785,33 +852,39 @@ def cmd_refine():
     Refinement pass (MUSE lifecycle step 5):
     Re-evaluate existing autoskill skills for quality and merge near-duplicates.
     """
-    config   = load_config()
-    prefix   = config["skill_prefix"]
-    as_skills = [
-        d for d in SKILLS_DIR.iterdir()
-        if d.name.startswith(prefix) and (d / "SKILL.md").exists()
-    ]
+    config    = load_config()
+    prefix    = config["skill_prefix"]
+    batch_sz  = int(config.get("refine_batch_size", 10))
+    timeout_s = int(config.get("refine_timeout", 150))
+    # Name-sort so skill families (as-meross-*, as-scraper-*, as-tailscale-*)
+    # land in the same batch — near-duplicates are still compared together.
+    as_skills = sorted(
+        (d for d in SKILLS_DIR.iterdir()
+         if d.name.startswith(prefix) and (d / "SKILL.md").exists()),
+        key=lambda d: d.name,
+    )
 
     if not as_skills:
         print("No autoskill-generated skills found.")
         return
 
-    print(f"Refining {len(as_skills)} autoskill(s)…")
+    n_batches = (len(as_skills) + batch_sz - 1) // batch_sz
+    print(f"Refining {len(as_skills)} autoskill(s) in {n_batches} batch(es) of up to {batch_sz}…")
 
-    # Build a consolidated view of all skills for the LLM
-    skill_texts = []
-    for d in as_skills:
-        skill_texts.append(f"### {d.name}\n{(d / 'SKILL.md').read_text()}")
-
-    refine_prompt = f"""\
-You are reviewing {len(as_skills)} auto-generated Claude Code skills.
-
-For each skill, assess:
+    # Process in small batches so each `claude -p` call stays fast. One batch
+    # timing out is logged and skipped — it no longer aborts the whole pass.
+    actions = []
+    for bi in range(n_batches):
+        batch = as_skills[bi * batch_sz:(bi + 1) * batch_sz]
+        skill_texts = [f"### {d.name}\n{(d / 'SKILL.md').read_text()}" for d in batch]
+        refine_prompt = f"""\
+You are reviewing a batch of {len(batch)} auto-generated Claude Code skills
+(one slice of a larger set). For each skill, assess:
 1. Is the description precise enough to trigger on the right user request?
 2. Are the instructions clear and actionable?
-3. Should any two skills be merged?
+3. Should any two skills IN THIS BATCH be merged? (Only merge within this batch.)
 
-Return a JSON array of improvements:
+Return ONLY a JSON array (no prose, no markdown fences):
 [
   {{
     "name": "existing-dir-name",
@@ -826,24 +899,25 @@ SKILLS:
 {'=' * 60}
 {(chr(10) + '=' * 60 + chr(10)).join(skill_texts)}
 """
-
-    try:
-        result = subprocess.run(
-            ["claude", "-p", "--output-format", "text"],
-            input=refine_prompt,
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip()[:300])
-        raw = result.stdout.strip()
-        raw = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.MULTILINE)
-        raw = re.sub(r"\n?```$",       "", raw, flags=re.MULTILINE)
-        actions = json.loads(raw)
-    except Exception as e:
-        print(f"Refine error: {e}")
-        return
+        try:
+            result = subprocess.run(
+                ["claude", "-p", "--output-format", "text"],
+                input=refine_prompt,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip()[:200])
+            raw = result.stdout.strip()
+            raw = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.MULTILINE)
+            raw = re.sub(r"\n?```$",       "", raw, flags=re.MULTILINE)
+            batch_actions = json.loads(raw)
+            actions.extend(batch_actions)
+            print(f"  batch {bi + 1}/{n_batches}: {len(batch_actions)} action(s)")
+        except Exception as e:
+            print(f"  batch {bi + 1}/{n_batches} SKIPPED: {e}")
+            continue
 
     for act in actions:
         name   = act.get("name", "")
@@ -873,10 +947,50 @@ description: {new_desc}
 
 {new_content}
 """)
+                _sync_skill_to_repo(name)
         else:
             print(f"  KEEP   {name}")
 
     print("Refinement complete.")
+
+
+def cmd_sync_repo():
+    """Bulk sync all as-* skills to the configured repo_sync_dir."""
+    config = load_config()
+    repo_dir_str = config.get("repo_sync_dir", "")
+    if not repo_dir_str:
+        print("No repo_sync_dir set in config.json. Add: \"repo_sync_dir\": \"~/repos/claude-config\"")
+        return
+    repo_dir = Path(repo_dir_str).expanduser()
+    if not (repo_dir / ".git").exists():
+        print(f"Repo not found at {repo_dir}")
+        return
+
+    prefix = config["skill_prefix"]
+    skills = sorted(
+        d for d in SKILLS_DIR.iterdir()
+        if d.name.startswith(prefix) and (d / "SKILL.md").exists()
+    )
+    if not skills:
+        print("No autoskills found.")
+        return
+
+    print(f"Syncing {len(skills)} autoskill(s) to {repo_dir}…")
+    for sd in skills:
+        dst = repo_dir / "skills" / sd.name
+        dst.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(sd / "SKILL.md", dst / "SKILL.md")
+        print(f"  {sd.name}")
+
+    subprocess.run(["git", "-C", str(repo_dir), "add", "skills/"], capture_output=True)
+    r = subprocess.run(
+        ["git", "-C", str(repo_dir), "commit", "-m", f"autoskill: bulk sync {len(skills)} skill(s)"],
+        capture_output=True, text=True,
+    )
+    if _git_sync_push(repo_dir):
+        print(f"\nSynced and pushed {len(skills)} skill(s) to {repo_dir.name}")
+    else:
+        print(f"\nCopied {len(skills)} skill(s) — push deferred (see log; may be a conflict to resolve)")
 
 
 def cmd_status():
@@ -950,6 +1064,8 @@ def main():
         cmd_refine()
     elif args[0] == "--status":
         cmd_status()
+    elif args[0] == "--sync-repo":
+        cmd_sync_repo()
     else:
         print(__doc__)
         sys.exit(1)

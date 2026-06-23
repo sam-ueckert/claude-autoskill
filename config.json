@@ -1,8 +1,10 @@
 {
   "enabled":              true,
-  "extract_every_turns":  8,
+  "extract_every_turns":  15,
   "min_turns_extraction": 4,
-  "max_skills_per_run":   3,
+  "max_skills_per_run":   2,
+  "refine_batch_size":    10,
+  "refine_timeout":       150,
   "model":                "claude-sonnet-4-6",
   "skill_prefix":         "as-",
   "max_content_chars":    2000,
