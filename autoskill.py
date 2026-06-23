@@ -1050,7 +1050,17 @@ def main():
     args = sys.argv[1:]
 
     if not args or args[0] == "--capture":
-        cmd_capture()
+        # Hook entry point: must emit NOTHING on stdout/stderr. Claude Code can
+        # inject a hook's stdout back into the session transcript, which would
+        # dump the extracted-skill JSON (or any stray print) into the
+        # conversation and corrupt the visible history. Route everything to the
+        # log file for the whole capture run.
+        import contextlib
+        with open(LOG_PATH, "a") as _hooklog, \
+             contextlib.redirect_stdout(_hooklog), \
+             contextlib.redirect_stderr(_hooklog):
+            cmd_capture()
+        return
     elif args[0] == "--extract" and len(args) > 1:
         cmd_extract(args[1])
     elif args[0] == "--import":
