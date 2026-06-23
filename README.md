@@ -100,6 +100,33 @@ python3 ~/.claude/autoskill/autoskill.py --status
 
 Expected output includes `Sessions archived`, `Skills installed`, and recent autoskills. If the DB is empty, the hooks haven't fired yet — start a new Claude Code session and run one prompt to seed the archive.
 
+### 4. (Optional) Auto-update
+
+Keep a machine's deployed engine current with this repo automatically, instead of re-running the `cp` steps by hand. Requires a local checkout at `~/repos/claude-autoskill`:
+
+```bash
+git clone git@github.com:wwt/claude-autoskill.git ~/repos/claude-autoskill
+cp ~/repos/claude-autoskill/selfupdate.sh ~/.claude/autoskill/
+chmod +x ~/.claude/autoskill/selfupdate.sh
+```
+
+`selfupdate.sh` runs `git pull --rebase --autostash` on the checkout, then deploys `autoskill.py`, `SKILL.md`, **and itself** to `~/.claude/...` whenever they differ from the checkout (idempotent; atomic `cp`+`mv`, so it can safely overwrite itself while running). It **never** copies `config.json` — that file is machine-local and may hold a personal `repo_sync_dir`. All output is routed to `autoskill.log` so the hook can't inject it into a session transcript.
+
+Wire it to run on every session start with a `SessionStart` hook:
+
+```json
+"SessionStart": [
+  {
+    "matcher": "",
+    "hooks": [
+      { "type": "command", "command": "bash ~/.claude/autoskill/selfupdate.sh >> ~/.claude/autoskill/autoskill.log 2>&1", "async": true }
+    ]
+  }
+]
+```
+
+(Or schedule it from cron/launchd, e.g. daily.) **Workflow note:** with auto-update enabled the repo is canonical — edit `autoskill.py` in `~/repos/claude-autoskill` (or push to the repo), **not** in `~/.claude/autoskill/`, since the next run overwrites the deployed copy.
+
 ---
 
 ## The `/autoskill` skill
@@ -300,7 +327,8 @@ Edit `~/.claude/autoskill/config.json`:
 ```
 ~/.claude/autoskill/
 ├── autoskill.py       # main script (this repo)
-├── config.json        # configuration (this repo)
+├── config.json        # configuration (this repo; machine-local, not auto-updated)
+├── selfupdate.sh      # optional auto-updater (this repo)
 ├── autoskill.log      # operation log (gitignored)
 └── data/
     └── archive.db     # SQLite: turns + extraction history (gitignored)
